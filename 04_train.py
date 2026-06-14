@@ -64,9 +64,41 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 META_COLS = {"video_id", "hb_value", "split", "protocol",
-             "anemia_label", "sample_weight", "hb_bin"}
+             "anemia_label", "sample_weight", "hb_bin",
+             # identity / raw demographic columns — excluded from the feature
+             # matrix (subject_id is used for grouping; raw sex/gender strings
+             # are encoded into numeric demo_* columns below).
+             "subject_id", "sex", "gender", "age"}
 
 HB_BIN_WIDTH = 1.0   # g/dL
+
+
+# ── demographics ──────────────────────────────────────────────────────────────
+
+def add_demographic_features(df: pd.DataFrame) -> list[str]:
+    """
+    Add numeric demographic features in-place when source columns are present.
+
+    Age and sex are strong, essentially-free predictors of haemoglobin: the
+    ablation in Ni et al. (Front. Physiol. 2026, doi:10.3389/fphys.2026.1637455)
+    reports that adding age+sex reduced error by ~14% (MRE 16.05% -> 2.20%).
+    WHO anaemia thresholds are themselves sex/age-specific, so the model should
+    have access to these variables.
+
+    Returns the list of demographic feature names that were actually added
+    (empty if the raw columns are unavailable).
+    """
+    added: list[str] = []
+    if "age" in df.columns:
+        df["demo_age"] = pd.to_numeric(df["age"], errors="coerce")
+        added.append("demo_age")
+    sex_col = "sex" if "sex" in df.columns else ("gender" if "gender" in df.columns else None)
+    if sex_col is not None:
+        # F -> 0, M -> 1 (any other / missing -> NaN, handled by the imputer)
+        s = df[sex_col].astype(str).str.upper().str[0]
+        df["demo_sex"] = s.map({"F": 0.0, "M": 1.0})
+        added.append("demo_sex")
+    return added
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -163,10 +195,20 @@ def cls_pipelines(k: int) -> dict:
 
 # ── group-aware CV ────────────────────────────────────────────────────────────
 
+def get_group_values(df: pd.DataFrame) -> np.ndarray:
+    """
+    Grouping key for GroupKFold.  Prefer subject_id so that all videos from the
+    same patient stay in the same fold (no patient-level leakage).  Fall back to
+    video_id only if subject_id is unavailable.
+    """
+    col = "subject_id" if "subject_id" in df.columns else "video_id"
+    return df[col].values
+
+
 def group_cv_mae(pipe, df: pd.DataFrame, feat_cols: list[str],
                  weights: np.ndarray) -> float:
     """GroupKFold CV — train with sample weights, validate MAE on held-out."""
-    groups = df["video_id"].values
+    groups = get_group_values(df)
     cv     = GroupKFold(n_splits=CV_FOLDS)
     maes   = []
     for tr_idx, val_idx in cv.split(df, groups=groups):
@@ -190,7 +232,7 @@ def group_cv_mae(pipe, df: pd.DataFrame, feat_cols: list[str],
 
 def group_cv_auc(pipe, df: pd.DataFrame, feat_cols: list[str]) -> float:
     """GroupKFold CV for AUC — SMOTE is inside pipeline so no weights needed."""
-    groups = df["video_id"].values
+    groups = get_group_values(df)
     cv     = GroupKFold(n_splits=CV_FOLDS)
     aucs   = []
     for tr_idx, val_idx in cv.split(df, groups=groups):
@@ -223,12 +265,35 @@ def main() -> None:
 
     train_df = pd.read_csv(FEATURES_TRAIN_CSV)
     test_df  = pd.read_csv(FEATURES_TEST_CSV)
+
+    # demographics → numeric features (age, sex) when available
+    demo_train = add_demographic_features(train_df)
+    demo_test  = add_demographic_features(test_df)
+    demo_cols  = sorted(set(demo_train) & set(demo_test))
+
     feat_cols = get_feat_cols(train_df)
+
+    # ── leakage guard: no subject may appear in both train and test ───────────
+    if "subject_id" in train_df.columns and "subject_id" in test_df.columns:
+        overlap = set(train_df["subject_id"]) & set(test_df["subject_id"])
+        if overlap:
+            raise ValueError(
+                f"Patient-level leakage: {len(overlap)} subject(s) appear in BOTH "
+                f"train and test splits, e.g. {sorted(overlap)[:5]}. "
+                f"Re-split by subject_id before training."
+            )
+        print(f"  Leakage check OK — {train_df['subject_id'].nunique()} train / "
+              f"{test_df['subject_id'].nunique()} test subjects, disjoint.")
+        print(f"  CV grouping key: subject_id")
+    else:
+        print("  WARNING: subject_id column absent — CV groups on video_id only "
+              "(cannot guarantee patient-level leakage protection).")
 
     train_df["anemia_label"] = train_df["hb_value"].apply(make_anemia_label)
     test_df["anemia_label"]  = test_df["hb_value"].apply(make_anemia_label)
 
-    print(f"\nFeatures     : {len(feat_cols)}")
+    print(f"\nFeatures     : {len(feat_cols)}"
+          + (f"  (incl. demographics: {demo_cols})" if demo_cols else "  (no demographics found)"))
     print(f"Train videos : {len(train_df)}  "
           f"(6s={len(train_df[train_df.protocol=='6s'])}  "
           f"30s={len(train_df[train_df.protocol=='30s'])})")
@@ -282,17 +347,33 @@ def main() -> None:
 
     test_mae = mean_absolute_error(y_test, y_pred)
     test_r2  = r2_score(y_test, y_pred)
+    test_rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
+    test_mape = float(np.mean(np.abs((y_test - y_pred) / np.clip(np.abs(y_test), 1e-6, None))) * 100)
     bands    = threshold_accuracy(y_test, y_pred, ACCURACY_BANDS)
 
+    # Mean-predictor baseline: MAE you get by always predicting the TRAIN mean.
+    # If the model cannot beat this, it has learned nothing about haemoglobin.
+    baseline_pred = float(np.mean(y_train))
+    baseline_mae  = float(np.mean(np.abs(y_test - baseline_pred)))
+    skill         = baseline_mae - test_mae   # >0 means the model adds value
+
     print(f"\n  ── Test set ──")
-    print(f"  MAE  = {test_mae:.4f} g/dL")
-    print(f"  R²   = {test_r2:.4f}")
+    print(f"  MAE   = {test_mae:.4f} g/dL")
+    print(f"  RMSE  = {test_rmse:.4f} g/dL")
+    print(f"  MAPE  = {test_mape:.2f} %")
+    print(f"  R²    = {test_r2:.4f}")
+    print(f"  Baseline MAE (predict train mean {baseline_pred:.2f}) = {baseline_mae:.4f} g/dL")
+    print(f"  Skill vs baseline = {skill:+.4f} g/dL  "
+          f"({'MODEL ADDS VALUE' if skill > 0 else 'NO BETTER THAN MEAN — model not learning'})")
     for k_name, v in bands.items():
         print(f"  {k_name:<20s} = {100*v:.1f}%")
 
     joblib.dump(best_reg, MODELS_DIR / "regressor.joblib")
     reg_metrics = {"model": best_reg_name, "cv_mae": r_cv,
-                   "test_mae": test_mae, "test_r2": test_r2, **bands}
+                   "test_mae": test_mae, "test_rmse": test_rmse,
+                   "test_mape": test_mape, "test_r2": test_r2,
+                   "baseline_mae": baseline_mae, "skill_vs_baseline": skill,
+                   **bands}
     with open(RESULTS_DIR / "regression_metrics.json", "w") as f:
         json.dump(reg_metrics, f, indent=2)
 

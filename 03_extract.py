@@ -73,6 +73,22 @@ def crop_roi(bgr: np.ndarray) -> np.ndarray:
     return bgr[y0:y1, x0:x1]
 
 
+def _circular_mean_hue(hue_opencv: np.ndarray) -> float:
+    """
+    Correct mean of the OpenCV Hue channel.
+
+    Hue is a CIRCULAR quantity: OpenCV encodes it in [0, 180) to represent the
+    full [0, 360) degree colour wheel, so 179 and 1 are 2 degrees apart, not 178.
+    A plain arithmetic ``.mean()`` (as used previously) is therefore invalid and
+    produces a meaningless feature.  We compute the proper circular mean via the
+    vector-average of the corresponding unit angles.
+    """
+    angles = hue_opencv.astype(np.float64) * (np.pi / 90.0)   # [0,180) -> [0,2π)
+    mean_angle = np.arctan2(np.sin(angles).mean(), np.cos(angles).mean())
+    mean_deg = np.degrees(mean_angle) % 360.0
+    return float(mean_deg / 2.0)                              # back to OpenCV scale
+
+
 def frame_channel_means(bgr: np.ndarray) -> np.ndarray:
     """Return mean ROI value for each of 7 channels."""
     roi  = crop_roi(bgr)
@@ -80,13 +96,13 @@ def frame_channel_means(bgr: np.ndarray) -> np.ndarray:
     hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).astype(np.float32)
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32)
     return np.array([
-        rgb[:, :, 0].mean(),   # R
-        rgb[:, :, 1].mean(),   # G
-        rgb[:, :, 2].mean(),   # B
-        hsv[:, :, 0].mean(),   # H
-        hsv[:, :, 1].mean(),   # S
-        hsv[:, :, 2].mean(),   # V
-        gray.mean(),           # Gray
+        rgb[:, :, 0].mean(),                # R
+        rgb[:, :, 1].mean(),                # G
+        rgb[:, :, 2].mean(),                # B
+        _circular_mean_hue(hsv[:, :, 0]),   # H  (circular mean — see helper)
+        hsv[:, :, 1].mean(),                # S
+        hsv[:, :, 2].mean(),                # V
+        gray.mean(),                        # Gray
     ], dtype=np.float32)
 
 
@@ -267,6 +283,12 @@ def main() -> None:
                 "split":    row["split"],
                 "protocol": row["protocol"],
             }
+            # Carry subject_id (for leakage-safe, subject-level CV) and any
+            # available demographics (age / sex) — strong predictors per the
+            # literature (Ni et al., Front. Physiol. 2026: +~14% accuracy).
+            for opt_col in ("subject_id", "age", "sex", "gender"):
+                if opt_col in row.index and pd.notna(row[opt_col]):
+                    rec[opt_col] = row[opt_col]
             for name, val in zip(feat_names, fv):
                 rec[name] = val
             records.append(rec)

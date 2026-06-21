@@ -160,9 +160,16 @@ def main() -> None:
         y_pred = reg["hb_pred"].values
 
         mae = float(np.abs(y_true - y_pred).mean())
+        # Mean-predictor baseline: always predict the mean of the true test Hb.
+        # The model is only useful if its MAE is clearly below this value.
+        baseline_mae = float(np.abs(y_true - y_true.mean()).mean())
+        skill = baseline_mae - mae
         print(f"\n── Regression (n={len(reg)}) ──")
         print(f"  MAE:   {mae:.4f} g/dL")
         print(f"  RMSE:  {float(np.sqrt(np.mean((y_true-y_pred)**2))):.4f} g/dL")
+        print(f"  Baseline MAE (predict mean {y_true.mean():.2f}): {baseline_mae:.4f} g/dL")
+        print(f"  Skill vs baseline: {skill:+.4f} g/dL  "
+              f"({'model adds value' if skill > 0 else 'NOT better than mean'})")
 
         for band in ACCURACY_BANDS:
             pct = 100 * (np.abs(y_true - y_pred) <= band).mean()
